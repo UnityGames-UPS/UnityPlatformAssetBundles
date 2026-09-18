@@ -1,0 +1,212 @@
+name: Sync Unity Games to S3
+
+on:
+  push:
+    branches:
+      - dev-builds
+    paths:
+      - 'Android/**'
+      - 'IOS/**'
+
+  workflow_dispatch:
+
+jobs:
+  sync-games:
+    runs-on: self-hosted
+
+    steps:
+
+      # ---------------------------- #
+      #      CHECKOUT REPOSITORY     #
+      # ---------------------------- #
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+
+      # ---------------------------- #
+      #    DETECT CHANGED GAMES      #
+      # ---------------------------- #
+      - name: Detect changed games
+        id: changed-games
+        shell: bash
+        run: |
+
+          echo "=========================================="
+          echo "Detecting changed games..."
+          echo "=========================================="
+
+          git diff --name-only \
+            "${{ github.event.before }}" \
+            "${{ github.sha }}" \
+            -- Android/ IOS/ \
+            | awk -F/ 'NF >= 2 {print $1 "/" $2}' \
+            | sort -u > changed_games.txt
+
+          echo ""
+          echo "Changed games:"
+          echo "------------------------------------------"
+
+          cat changed_games.txt
+
+          echo ""
+          echo "------------------------------------------"
+
+
+      # ---------------------------- #
+      #       SYNC GAMES TO S3       #
+      # ---------------------------- #
+      - name: Sync changed games to S3
+        shell: bash
+        run: |
+
+          while read -r game; do
+
+            [ -z "$game" ] && continue
+
+            PLATFORM=$(echo "$game" | cut -d/ -f1)
+            GAME=$(echo "$game" | cut -d/ -f2)
+
+            LOCAL_PATH="$PLATFORM/$GAME"
+            S3_PATH="s3://unity-platform-dev/$PLATFORM/Games/$GAME/"
+
+            echo ""
+            echo "=========================================="
+            echo "Syncing Game"
+            echo "Platform : $PLATFORM"
+            echo "Game     : $GAME"
+            echo "Source   : $LOCAL_PATH"
+            echo "S3       : $S3_PATH"
+            echo "=========================================="
+
+            if [ -d "$LOCAL_PATH" ]; then
+
+              echo "Game folder exists."
+              echo "Syncing files to S3..."
+
+              aws s3 sync \
+                "$LOCAL_PATH/" \
+                "$S3_PATH" \
+                --delete
+
+              echo "S3 sync completed successfully."
+
+            else
+
+              echo "Game folder was deleted from repository."
+              echo "Removing game from S3..."
+
+              aws s3 rm \
+                "$S3_PATH" \
+                --recursive
+
+              echo "S3 deletion completed."
+
+            fi
+
+          done < changed_games.txt
+
+
+      # ---------------------------- #
+      #   CLOUDFRONT INVALIDATION    #
+      # ---------------------------- #
+      - name: CloudFront Invalidation
+        shell: bash
+        run: |
+
+          while read -r game; do
+
+            [ -z "$game" ] && continue
+
+            PLATFORM=$(echo "$game" | cut -d/ -f1)
+            GAME=$(echo "$game" | cut -d/ -f2)
+
+            INVALIDATION_PATH="/$PLATFORM/Games/$GAME/*"
+
+            echo ""
+            echo "=========================================="
+            echo "CloudFront Invalidation"
+            echo "Distribution : E2N87ID0IDFB9J"
+            echo "Path         : $INVALIDATION_PATH"
+            echo "=========================================="
+
+            aws cloudfront create-invalidation \
+              --distribution-id E2N87ID0IDFB9J \
+              --paths "$INVALIDATION_PATH"
+
+            echo "CloudFront invalidation created."
+
+          done < changed_games.txt
+
+
+      # ---------------------------- #
+      #   DISCORD NOTIFICATION       #
+      # ---------------------------- #
+      - name: Discord Notification
+        if: always()
+        shell: bash
+        run: |
+
+          STATUS="${{ job.status }}"
+
+          COLOR=3066993
+          TITLE="✅ S3 Upload Successful"
+
+          if [ "$STATUS" != "success" ]; then
+            COLOR=15158332
+            TITLE="❌ S3 Upload Failed"
+          fi
+
+          WEBHOOKS=(
+            "https://discord.com/api/webhooks/1433719872063275108/ycFXIhb82-rI3pOMAJFMRgpMD72xadJJzW-t_3UohOZ_6bDIdLsIUOdX5_hxGA0oKvE_"
+            "https://discord.com/api/webhooks/1494584505900601490/CE4PgrqU2tmG8VCPE6y3Zs-9AdZGaiLZKFOPxnB5DFztSIAzUA2d2kuwvcbWc_qMFg97"
+          )
+
+          CHANGED_GAMES=$(cat changed_games.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+
+          if [ -z "$CHANGED_GAMES" ]; then
+            CHANGED_GAMES="No game changes detected"
+          fi
+
+          for WEBHOOK in "${WEBHOOKS[@]}"; do
+
+            curl --fail \
+              -H "Content-Type: application/json" \
+              -X POST \
+              -d "{
+                \"username\": \"Deploy Bot\",
+                \"embeds\": [{
+                  \"title\": \"$TITLE\",
+                  \"color\": $COLOR,
+                  \"fields\": [
+                    {
+                      \"name\": \"Changed Games\",
+                      \"value\": \"$CHANGED_GAMES\"
+                    },
+                    {
+                      \"name\": \"S3 Bucket\",
+                      \"value\": \"unity-platform-dev\"
+                    },
+                    {
+                      \"name\": \"CloudFront ID\",
+                      \"value\": \"E2N87ID0IDFB9J\"
+                    },
+                    {
+                      \"name\": \"Triggered By\",
+                      \"value\": \"${{ github.actor }}\"
+                    },
+                    {
+                      \"name\": \"Branch\",
+                      \"value\": \"${{ github.ref_name }}\"
+                    },
+                    {
+                      \"name\": \"Workflow\",
+                      \"value\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+                    }
+                  ]
+                }]
+              }" \
+              "$WEBHOOK"
+
+          done
