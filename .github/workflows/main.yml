@@ -59,7 +59,7 @@ jobs:
               | sed 's#/$##' \
               | grep -E "^${GAME//./\\.}\.v\.0\.0\.[0-9]+$" \
               | sort -V \
-              | tail -n 1)
+              | tail -n 1 || true)
 
             if [ -n "$EXISTING_VERSION" ]; then
 
