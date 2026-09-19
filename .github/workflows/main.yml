@@ -1,4 +1,3 @@
-```yaml
 name: Sync Unity Games to S3
 
 on:
@@ -42,42 +41,67 @@ jobs:
             [ -z "$game" ] && continue
 
             PLATFORM=$(echo "$game" | cut -d/ -f1)
-            GAME_VERSION=$(echo "$game" | cut -d/ -f2)
+            GAME=$(echo "$game" | cut -d/ -f2)
 
-            LOCAL_PATH="$PLATFORM/$GAME_VERSION"
+            LOCAL_PATH="$PLATFORM/$GAME"
             S3_BASE="s3://unity-platform-dev/$PLATFORM/Games"
 
-            if [ -d "$LOCAL_PATH" ]; then
+            if [ ! -d "$LOCAL_PATH" ]; then
+              aws s3 rm \
+                "$S3_BASE/$GAME/" \
+                --recursive
 
-              GAME_NAME=$(echo "$GAME_VERSION" | sed -E 's/-[0-9]+$//')
+              continue
+            fi
 
-              aws s3 ls "$S3_BASE/" | awk '{print $2}' | while read -r FOLDER; do
+            EXISTING_VERSION=$(aws s3 ls "$S3_BASE/" \
+              | awk '{print $2}' \
+              | sed 's#/$##' \
+              | grep -E "^${GAME//./\\.}\.v\.0\.0\.[0-9]+$" \
+              | sort -V \
+              | tail -n 1)
 
-                [ -z "$FOLDER" ] && continue
+            if [ -n "$EXISTING_VERSION" ]; then
 
-                OLD_VERSION="${FOLDER%/}"
+              CURRENT_NUMBER=$(echo "$EXISTING_VERSION" | sed -E 's/.*\.v\.0\.0\.([0-9]+)$/\1/')
+              NEXT_NUMBER=$((CURRENT_NUMBER + 1))
 
-                if [[ "$OLD_VERSION" == "$GAME_NAME-"* ]] &&
-                   [[ "$OLD_VERSION" != "$GAME_VERSION" ]]; then
-
-                  aws s3 rm \
-                    "$S3_BASE/$OLD_VERSION/" \
-                    --recursive
-
-                fi
-
-              done
+              NEW_VERSION="$GAME.v.0.0.$NEXT_NUMBER"
 
               aws s3 sync \
                 "$LOCAL_PATH/" \
-                "$S3_BASE/$GAME_VERSION/" \
+                "$S3_BASE/$NEW_VERSION/" \
                 --delete
+
+              aws s3 rm \
+                "$S3_BASE/$EXISTING_VERSION/" \
+                --recursive
+
+              aws s3 rm \
+                "$S3_BASE/$GAME/" \
+                --recursive
+
+            elif aws s3 ls "$S3_BASE/$GAME/" | grep -q .; then
+
+              NEW_VERSION="$GAME.v.0.0.1"
+
+              aws s3 sync \
+                "$LOCAL_PATH/" \
+                "$S3_BASE/$NEW_VERSION/" \
+                --delete
+
+              aws s3 rm \
+                "$S3_BASE/$GAME/" \
+                --recursive
 
             else
 
-              aws s3 rm \
-                "$S3_BASE/$GAME_VERSION/" \
-                --recursive
+              NEW_VERSION="$GAME"
+
+              aws s3 sync \
+                "$LOCAL_PATH/" \
+                "$S3_BASE/$NEW_VERSION/" \
+                --delete
 
             fi
 
@@ -92,13 +116,11 @@ jobs:
             [ -z "$game" ] && continue
 
             PLATFORM=$(echo "$game" | cut -d/ -f1)
-            GAME_VERSION=$(echo "$game" | cut -d/ -f2)
-
-            INVALIDATION_PATH="/$PLATFORM/Games/$GAME_VERSION/*"
+            GAME=$(echo "$game" | cut -d/ -f2)
 
             aws cloudfront create-invalidation \
               --distribution-id E2N87ID0IDFB9J \
-              --paths "$INVALIDATION_PATH"
+              --paths "/$PLATFORM/Games/$GAME*" 
 
           done < changed_games.txt
 
@@ -169,4 +191,3 @@ jobs:
               "$WEBHOOK"
 
           done
-```
