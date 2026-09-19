@@ -76,12 +76,12 @@ jobs:
             # Check existing versioned game file BEFORE syncing (sync --delete will remove it)
             EXISTING_VERSIONED_FILE=$(aws s3 ls "$S3_GAME_PATH/" 2>/dev/null \
               | awk '{print $4}' \
-              | grep -i "^${GAME_LOWER}\.v\.0\.0\.[0-9]+$" \
+              | grep -iE "^${GAME_LOWER}\.v\.0\.0\.[0-9]+$" \
               | sort -V \
               | tail -n 1 || true)
 
             if [ -n "$EXISTING_VERSIONED_FILE" ]; then
-              CURRENT_NUMBER=$(echo "$EXISTING_VERSIONED_FILE" | sed -E "s/^${GAME_LOWER}\.v\.0\.0\.([0-9]+)$/\1/I")
+              CURRENT_NUMBER=$(echo "$EXISTING_VERSIONED_FILE" | sed -E "s/^${GAME_LOWER}\.v\.0\.0\.([0-9]+)$/\1/")
               case "$CURRENT_NUMBER" in
                 ''|*[!0-9]*) CURRENT_NUMBER=0 ;;
               esac
