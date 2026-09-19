@@ -26,105 +26,90 @@ jobs:
         id: changed-games
         shell: bash
         run: |
-          git diff --name-only \
-            "${{ github.event.before }}" \
-            "${{ github.sha }}" \
-            -- Android/ IOS/ \
-            | awk -F/ 'NF >= 2 {print $1 "/" $2}' \
-            | sort -u > changed_games.txt
+          set -uo pipefail
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            BEFORE=$(git rev-parse "${AFTER}~1" 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$BEFORE" ]; then
+            echo "No previous commit found, treating all games as changed."
+            git ls-tree -r --name-only "$AFTER" -- Android/ IOS/ \
+              | awk -F/ 'NF >= 2 {print $1 "/" $2}' \
+              | sort -u > changed_games.txt
+          else
+            git diff --name-only "$BEFORE" "$AFTER" -- Android/ IOS/ \
+              | awk -F/ 'NF >= 2 {print $1 "/" $2}' \
+              | sort -u > changed_games.txt
+          fi
+
+          echo "Changed games:"
+          cat changed_games.txt
 
       - name: Sync changed games to S3
         shell: bash
         run: |
+          set -uo pipefail
 
-          while read -r game; do
+          while IFS= read -r game || [ -n "$game" ]; do
 
             [ -z "$game" ] && continue
 
             PLATFORM=$(echo "$game" | cut -d/ -f1)
             GAME=$(echo "$game" | cut -d/ -f2)
+            GAME_LOWER=$(echo "$GAME" | tr '[:upper:]' '[:lower:]')
 
             LOCAL_PATH="$PLATFORM/$GAME"
-            S3_BASE="s3://unity-platform-dev/$PLATFORM/Games"
+            S3_GAME_PATH="s3://unity-platform-dev/$PLATFORM/Games/$GAME"
 
-            S3_FOLDERS=$(aws s3 ls "$S3_BASE/" 2>/dev/null || true)
+            echo "▶ Processing $PLATFORM/$GAME"
 
-            EXISTING_VERSION=$(echo "$S3_FOLDERS" \
-              | awk '{print $2}' \
-              | sed 's#/$##' \
-              | grep -E "^${GAME//./\\.}\.v\.0\.0\.[0-9]+$" \
+            if [ ! -d "$LOCAL_PATH" ]; then
+              echo "  Local path missing — deleting $S3_GAME_PATH/ from S3"
+              aws s3 rm "$S3_GAME_PATH/" --recursive \
+                || { echo "::error::Failed to delete $S3_GAME_PATH/"; exit 1; }
+              continue
+            fi
+
+            # Check existing versioned game file BEFORE syncing (sync --delete will remove it)
+            EXISTING_VERSIONED_FILE=$(aws s3 ls "$S3_GAME_PATH/" 2>/dev/null \
+              | awk '{print $4}' \
+              | grep -i "^${GAME_LOWER}\.v\.0\.0\.[0-9]+$" \
               | sort -V \
               | tail -n 1 || true)
 
-            if [ ! -d "$LOCAL_PATH" ]; then
-
-              if [ -n "$EXISTING_VERSION" ]; then
-                aws s3 rm \
-                  "$S3_BASE/$EXISTING_VERSION/" \
-                  --recursive
-              fi
-
-              aws s3 rm \
-                "$S3_BASE/$GAME/" \
-                --recursive
-
-              continue
-
+            if [ -n "$EXISTING_VERSIONED_FILE" ]; then
+              CURRENT_NUMBER=$(echo "$EXISTING_VERSIONED_FILE" | sed -E "s/^${GAME_LOWER}\.v\.0\.0\.([0-9]+)$/\1/I")
+              case "$CURRENT_NUMBER" in
+                ''|*[!0-9]*) CURRENT_NUMBER=0 ;;
+              esac
+              NEXT_NUMBER=$((CURRENT_NUMBER + 1))
+              echo "  Existing versioned file: $EXISTING_VERSIONED_FILE (next -> v.0.0.$NEXT_NUMBER)"
+            else
+              NEXT_NUMBER=1
+              echo "  No existing versioned file found (next -> v.0.0.$NEXT_NUMBER)"
             fi
 
-            if [ -n "$EXISTING_VERSION" ]; then
+            echo "  Syncing $LOCAL_PATH -> $S3_GAME_PATH/"
+            aws s3 sync "$LOCAL_PATH/" "$S3_GAME_PATH/" --delete \
+              || { echo "::error::Failed to sync $LOCAL_PATH"; exit 1; }
 
-              CURRENT_NUMBER=$(echo "$EXISTING_VERSION" \
-                | sed -E 's/.*\.v\.0\.0\.([0-9]+)$/\1/')
+            # Find the freshly-uploaded plain game file and rename it with the version suffix
+            MATCHED_KEY=$(aws s3 ls "$S3_GAME_PATH/" 2>/dev/null \
+              | awk '{print $4}' \
+              | grep -ix "^${GAME_LOWER}$" || true)
 
-              NEXT_NUMBER=$((CURRENT_NUMBER + 1))
-
-              NEW_VERSION="$GAME.v.0.0.$NEXT_NUMBER"
-
-              aws s3 sync \
-                "$LOCAL_PATH/" \
-                "$S3_BASE/$NEW_VERSION/" \
-                --delete
-
-              aws s3 rm \
-                "$S3_BASE/$EXISTING_VERSION/" \
-                --recursive
-
-              aws s3 rm \
-                "$S3_BASE/$GAME/" \
-                --recursive
-
+            if [ -n "$MATCHED_KEY" ]; then
+              NEW_NAME="${GAME_LOWER}.v.0.0.$NEXT_NUMBER"
+              echo "  Renaming file: $MATCHED_KEY -> $NEW_NAME"
+              aws s3 mv \
+                "$S3_GAME_PATH/$MATCHED_KEY" \
+                "$S3_GAME_PATH/$NEW_NAME" \
+                || echo "::warning::Failed to rename $MATCHED_KEY (continuing)"
             else
-
-              GAME_EXISTS=$(echo "$S3_FOLDERS" \
-                | awk '{print $2}' \
-                | grep -Fx "${GAME}/" \
-                || true)
-
-              if [ -n "$GAME_EXISTS" ]; then
-
-                NEW_VERSION="$GAME.v.0.0.1"
-
-                aws s3 sync \
-                  "$LOCAL_PATH/" \
-                  "$S3_BASE/$NEW_VERSION/" \
-                  --delete
-
-                aws s3 rm \
-                  "$S3_BASE/$GAME/" \
-                  --recursive
-
-              else
-
-                NEW_VERSION="$GAME"
-
-                aws s3 sync \
-                  "$LOCAL_PATH/" \
-                  "$S3_BASE/$NEW_VERSION/" \
-                  --delete
-
-              fi
-
+              echo "::warning::No file matching '$GAME_LOWER' found in $S3_GAME_PATH/ — nothing to rename"
             fi
 
           done < changed_games.txt
@@ -132,17 +117,20 @@ jobs:
       - name: CloudFront Invalidation
         shell: bash
         run: |
+          set -uo pipefail
 
-          while read -r game; do
+          while IFS= read -r game || [ -n "$game" ]; do
 
             [ -z "$game" ] && continue
 
             PLATFORM=$(echo "$game" | cut -d/ -f1)
             GAME=$(echo "$game" | cut -d/ -f2)
 
+            echo "Invalidating CloudFront for /$PLATFORM/Games/$GAME*"
             aws cloudfront create-invalidation \
               --distribution-id E2N87ID0IDFB9J \
-              --paths "/$PLATFORM/Games/$GAME*"
+              --paths "/$PLATFORM/Games/$GAME*" \
+              || echo "::warning::CloudFront invalidation failed for $GAME (continuing)"
 
           done < changed_games.txt
 
@@ -150,6 +138,7 @@ jobs:
         if: always()
         shell: bash
         run: |
+          set -uo pipefail
 
           STATUS="${{ job.status }}"
 
@@ -173,6 +162,7 @@ jobs:
           fi
 
           for WEBHOOK in "${WEBHOOKS[@]}"; do
+            [ -z "$WEBHOOK" ] && continue
 
             curl --fail \
               -H "Content-Type: application/json" \
@@ -183,33 +173,14 @@ jobs:
                   \"title\": \"$TITLE\",
                   \"color\": $COLOR,
                   \"fields\": [
-                    {
-                      \"name\": \"Changed Games\",
-                      \"value\": \"$CHANGED_GAMES\"
-                    },
-                    {
-                      \"name\": \"S3 Bucket\",
-                      \"value\": \"unity-platform-dev\"
-                    },
-                    {
-                      \"name\": \"CloudFront ID\",
-                      \"value\": \"E2N87ID0IDFB9J\"
-                    },
-                    {
-                      \"name\": \"Triggered By\",
-                      \"value\": \"${{ github.actor }}\"
-                    },
-                    {
-                      \"name\": \"Branch\",
-                      \"value\": \"${{ github.ref_name }}\"
-                    },
-                    {
-                      \"name\": \"Workflow\",
-                      \"value\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
-                    }
+                    { \"name\": \"Changed Games\", \"value\": \"$CHANGED_GAMES\" },
+                    { \"name\": \"S3 Bucket\", \"value\": \"unity-platform-dev\" },
+                    { \"name\": \"CloudFront ID\", \"value\": \"E2N87ID0IDFB9J\" },
+                    { \"name\": \"Triggered By\", \"value\": \"${{ github.actor }}\" },
+                    { \"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\" },
+                    { \"name\": \"Workflow\", \"value\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\" }
                   ]
                 }]
               }" \
-              "$WEBHOOK"
-
+              "$WEBHOOK" || echo "::warning::Discord webhook notification failed"
           done
