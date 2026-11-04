@@ -7,6 +7,7 @@ on:
     paths:
       - 'Android/**'
       - 'IOS/**'
+      - 'WebGL/**'
       - 'README.md'
 
   workflow_dispatch:
@@ -16,7 +17,6 @@ jobs:
     runs-on: self-hosted
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -27,6 +27,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+
           BEFORE="${{ github.event.before }}"
           AFTER="${{ github.sha }}"
 
@@ -35,11 +36,11 @@ jobs:
           fi
 
           if [ -z "$BEFORE" ]; then
-            git ls-tree -r --name-only "$AFTER" -- Android/ IOS/ \
+            git ls-tree -r --name-only "$AFTER" -- Android/ IOS/ WebGL/ \
               | awk -F/ 'NF >= 2 {print $1 "/" $2}' \
               | sort -u > changed_games.txt
           else
-            git diff --name-only "$BEFORE" "$AFTER" -- Android/ IOS/ \
+            git diff --name-only "$BEFORE" "$AFTER" -- Android/ IOS/ WebGL/ \
               | awk -F/ 'NF >= 2 {print $1 "/" $2}' \
               | sort -u > changed_games.txt
           fi
@@ -122,7 +123,7 @@ jobs:
 
             cat > "$TEMP_VERSION_FILE" <<EOF
           {
-              "version": "$NEW_VERSION"
+            "version": "$NEW_VERSION"
           }
           EOF
 
@@ -180,6 +181,7 @@ jobs:
           [ -z "$CHANGED_GAMES" ] && CHANGED_GAMES="No game changes detected"
 
           WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COMMIT_URL="https://github.com/${{ github.repository }}/commit/${{ github.sha }}"
 
           for WEBHOOK in "${WEBHOOKS[@]}"; do
             [ -z "$WEBHOOK" ] && continue
@@ -193,12 +195,14 @@ jobs:
                   \"title\": \"$TITLE\",
                   \"color\": $COLOR,
                   \"fields\": [
-                    {\"name\": \"Changed Games\", \"value\": \"$CHANGED_GAMES\"},
-                    {\"name\": \"S3 Bucket\", \"value\": \"unity-platform-dev\"},
-                    {\"name\": \"CloudFront ID\", \"value\": \"E2N87ID0IDFB9J\"},
-                    {\"name\": \"Triggered By\", \"value\": \"${{ github.actor }}\"},
-                    {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\"},
-                    {\"name\": \"Workflow\", \"value\": \"$WORKFLOW_URL\"}
+                    {\"name\": \"Changed Games\", \"value\": \"$CHANGED_GAMES\", \"inline\": false},
+                    {\"name\": \"S3 Bucket\", \"value\": \"unity-platform-dev\", \"inline\": false},
+                    {\"name\": \"CloudFront ID\", \"value\": \"E2N87ID0IDFB9J\", \"inline\": false},
+                    {\"name\": \"Triggered By\", \"value\": \"${{ github.actor }}\", \"inline\": false},
+                    {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"inline\": false},
+                    {\"name\": \"Commit ID\", \"value\": \"[${{ github.sha }}]($COMMIT_URL)\", \"inline\": false},
+                    {\"name\": \"Commit Message\", \"value\": \"${{ github.event.head_commit.message || 'Manual workflow dispatch' }}\", \"inline\": false},
+                    {\"name\": \"Workflow\", \"value\": \"[View Workflow]($WORKFLOW_URL)\", \"inline\": false}
                   ]
                 }]
               }" \
