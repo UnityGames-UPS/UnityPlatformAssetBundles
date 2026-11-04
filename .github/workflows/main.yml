@@ -159,53 +159,101 @@ jobs:
 
       - name: Discord Notification
         if: always()
+        continue-on-error: true
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_DEV }}
+          DEPLOY_STATUS: ${{ job.status }}
+          S3_BUCKET: unity-platform-dev
+          CLOUDFRONT_ID: E2N87ID0IDFB9J
+          ACTOR: ${{ github.actor }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message || '' }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
         shell: bash
         run: |
           set -uo pipefail
 
-          STATUS="${{ job.status }}"
-          COLOR=3066993
-          TITLE="✅ S3 Upload Successful"
-
-          if [ "$STATUS" != "success" ]; then
-            COLOR=15158332
-            TITLE="❌ S3 Upload Failed"
+          if [[ -z "$DISCORD_WEBHOOK" ]]; then
+            echo "::warning::Development Discord webhook is not configured."
+            exit 0
           fi
 
-          WEBHOOKS=(
-            "${{ secrets.DISCORD_WEBHOOK_1 }}"
-            "${{ secrets.DISCORD_WEBHOOK_2 }}"
-          )
+          ENVIRONMENT="Development"
 
-          CHANGED_GAMES=$(cat changed_games.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//')
-          [ -z "$CHANGED_GAMES" ] && CHANGED_GAMES="No game changes detected"
+          # Changed games, comma separated
+          CHANGED_GAMES="$(paste -sd, changed_games.txt 2>/dev/null | sed 's/,/, /g' || true)"
+          if [[ -z "$CHANGED_GAMES" ]]; then
+            CHANGED_GAMES="No game changes detected"
+          fi
 
-          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          COMMIT_URL="https://github.com/${{ github.repository }}/commit/${{ github.sha }}"
+          # Use only the first line of the commit message
+          if [[ -z "$COMMIT_MESSAGE" ]]; then
+            COMMIT_MESSAGE="Manual workflow dispatch"
+          else
+            COMMIT_MESSAGE="${COMMIT_MESSAGE%%$'\n'*}"
+          fi
 
-          for WEBHOOK in "${WEBHOOKS[@]}"; do
-            [ -z "$WEBHOOK" ] && continue
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          COMMIT_URL="${SERVER_URL}/${REPOSITORY}/commit/${COMMIT_SHA}"
+          WORKFLOW_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
 
-            curl --fail \
-              -H "Content-Type: application/json" \
-              -X POST \
-              -d "{
-                \"username\": \"Deploy Bot\",
-                \"embeds\": [{
-                  \"title\": \"$TITLE\",
-                  \"color\": $COLOR,
-                  \"fields\": [
-                    {\"name\": \"Changed Games\", \"value\": \"$CHANGED_GAMES\", \"inline\": false},
-                    {\"name\": \"S3 Bucket\", \"value\": \"unity-platform-dev\", \"inline\": false},
-                    {\"name\": \"CloudFront ID\", \"value\": \"E2N87ID0IDFB9J\", \"inline\": false},
-                    {\"name\": \"Triggered By\", \"value\": \"${{ github.actor }}\", \"inline\": false},
-                    {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"inline\": false},
-                    {\"name\": \"Commit ID\", \"value\": \"[${{ github.sha }}]($COMMIT_URL)\", \"inline\": false},
-                    {\"name\": \"Commit Message\", \"value\": \"${{ github.event.head_commit.message || 'Manual workflow dispatch' }}\", \"inline\": false},
-                    {\"name\": \"Workflow\", \"value\": \"[View Workflow]($WORKFLOW_URL)\", \"inline\": false}
-                  ]
-                }]
-              }" \
-              "$WEBHOOK" \
-              || echo "::warning::Discord webhook notification failed"
-          done
+          DEPLOY_TIME="$(TZ='Asia/Kolkata' date '+%d %b %Y, %I:%M %p IST')"
+
+          if [[ "$DEPLOY_STATUS" == "success" ]]; then
+            COLOR=3066993
+            TITLE="✅ ${ENVIRONMENT} S3 Upload Successful"
+            STATUS_LINE="Success"
+          else
+            COLOR=15158332
+            TITLE="❌ ${ENVIRONMENT} S3 Upload Failed"
+            STATUS_LINE="Failed"
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg environment "$ENVIRONMENT" \
+            --arg status "$STATUS_LINE" \
+            --arg branch "$BRANCH" \
+            --arg bucket "$S3_BUCKET" \
+            --arg cloudfront "$CLOUDFRONT_ID" \
+            --arg commit "$SHORT_SHA" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg games "${CHANGED_GAMES:0:1000}" \
+            --arg message "${COMMIT_MESSAGE:0:1000}" \
+            --arg actor "$ACTOR" \
+            --arg workflow_url "$WORKFLOW_URL" \
+            --arg deployed_at "$DEPLOY_TIME" \
+            --argjson color "$COLOR" \
+            '{
+              username: "Deploy Bot",
+              embeds: [{
+                title: $title,
+                color: $color,
+                fields: [
+                  {name: "Environment", value: $environment, inline: true},
+                  {name: "Status", value: $status, inline: true},
+                  {name: "Branch", value: $branch, inline: true},
+                  {name: "S3 Bucket", value: $bucket, inline: true},
+                  {name: "CloudFront ID", value: $cloudfront, inline: true},
+                  {name: "Commit ID", value: ("[" + $commit + "](" + $commit_url + ")"), inline: true},
+                  {name: "Changed Games", value: $games, inline: false},
+                  {name: "Commit Message", value: $message, inline: false},
+                  {name: "Triggered By", value: $actor, inline: true},
+                  {name: "Workflow", value: ("[View Run](" + $workflow_url + ")"), inline: false}
+                ],
+                footer: {
+                  text: ("Deployment Time: " + $deployed_at)
+                }
+              }]
+            }')
+
+          curl --fail-with-body --silent --show-error \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data "$PAYLOAD" \
+            "$DISCORD_WEBHOOK"
+
+          echo "Discord notification sent successfully."
